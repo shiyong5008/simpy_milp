@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+import csv
 import logging
 import math
 import random
-import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Generator, Iterator
 
 import simpy
 
 from fab_sim.config import FabConfig, OperationConfig, ToolOperationConfig
 from fab_sim.event_log import EventLog
+from fab_sim.milp_scheduler import MilpBatchScheduler
 from fab_sim.models import Lot, Tool
 
 LOGGER = logging.getLogger(__name__)
+TWO_LOT_WAIT_MINUTES = 6 * 60
+
+
+@dataclass
+class PlannedBatch:
+    tool: Tool
+    lot_count: int
+    entered_908: simpy.Event
 
 
 @dataclass(frozen=True)
@@ -75,7 +84,9 @@ class SimulationParameters:
         if self.wafers_per_lot <= 0:
             raise ValueError("Wafer count per lot must be greater than zero")
         if self.op_907_release <= 0:
-            raise ValueError("Operation 907 release count must be greater than zero")
+            raise ValueError(
+                "Operation 908 WIP batches per tool must be greater than zero"
+            )
 
 
 class FabSimulation:
@@ -93,7 +104,7 @@ class FabSimulation:
         self.lots: dict[str, Lot] = {}
         self.arrived_lots: simpy.Store = simpy.Store(self.env)
         self.waiting_lots: simpy.Store = simpy.Store(self.env)
-        self.planned_tools: simpy.Store = simpy.Store(self.env)
+        self.planned_batches: simpy.Store = simpy.Store(self.env)
         self.tools = self._create_tools()
         self.tool_by_id = {tool.config.tool_id: tool for tool in self.tools}
         self.operation_by_id = {
@@ -101,8 +112,16 @@ class FabSimulation:
         }
         self.mappings_by_operation = self._mappings_by_operation()
         self.op_908_mappings = self.mappings_by_operation.get(908, [])
-        _, self.max_batch_lots = self._batch_lot_limits(
+        self.min_batch_lots, self.max_batch_lots = self._batch_lot_limits(
             self.op_908_mappings
+        )
+        self.stage_tool = self.tool_by_id[self.mappings_by_operation[907][0].tool_id]
+        self.op_908_tools = [
+            self.tool_by_id[mapping.tool_id]
+            for mapping in self.op_908_mappings
+        ]
+        self.batch_scheduler = MilpBatchScheduler(
+            self.min_batch_lots, self.max_batch_lots
         )
         self.batch_slot_available = self.env.event()
         self._next_lot_number = 101
@@ -162,21 +181,43 @@ class FabSimulation:
                 status=lot.status,
                 details=f"{lot.wafer_count} wafers",
             )
-            self._enter_operation(lot, self.operation_by_id[907])
+            operation = self.operation_by_id[907]
+            self.events.record(
+                self.env.now,
+                "lot",
+                lot_id,
+                "arrived at 907 entrance",
+                operation_id=operation.ops_id,
+                status=lot.status,
+            )
+            self._enter_operation(lot, operation)
             yield self.arrived_lots.put(lot)
 
     def _release_lots_to_907(self) -> Iterator[simpy.Event]:
         operation = self.operation_by_id[907]
         while True:
-            batch: list[Lot] = []
-            for _ in range(self.max_batch_lots):
-                batch.append((yield self.arrived_lots.get()))
+            batch = yield from self._next_batch_at_907()
             while True:
-                tool = self._reserve_tool_for_batch(self.op_908_mappings)
-                if tool is not None:
+                decision = self.batch_scheduler.choose_batch(
+                    batch,
+                    self.op_908_tools,
+                    self.operation_by_id[908],
+                    self.env.now,
+                    max_outstanding_batches=self.parameters.op_907_release,
+                    stage_time_mins=(
+                        self.stage_tool.operation_config.proc_time_per_load_mins
+                    ),
+                )
+                if decision is not None:
                     break
                 yield self.batch_slot_available
-            yield self.planned_tools.put(tool)
+
+            plan = PlannedBatch(
+                tool=decision.tool,
+                lot_count=decision.lot_count,
+                entered_908=self.env.event(),
+            )
+            yield self.planned_batches.put(plan)
             for lot in batch:
                 self.events.record(
                     self.env.now,
@@ -185,15 +226,38 @@ class FabSimulation:
                     "released to STG907",
                     operation_id=operation.ops_id,
                     status=lot.status,
-                    details=f"release batch of {len(batch)} lots",
+                    details=(
+                        f"release batch of {len(batch)} lots; "
+                        f"assigned {decision.tool.config.tool_id}; "
+                        f"estimated 908 queue {decision.queue_time:.1f} min"
+                    ),
                 )
                 self.env.process(self._lot_flow(lot))
+            yield plan.entered_908
+
+    def _next_batch_at_907(self) -> Generator[simpy.Event, None, list[Lot]]:
+        batch: list[Lot] = []
+        for _ in range(self.min_batch_lots):
+            batch.append((yield self.arrived_lots.get()))
+
+        while len(batch) < self.max_batch_lots:
+            third_lot = self.arrived_lots.get()
+            timeout = self.env.timeout(TWO_LOT_WAIT_MINUTES)
+            result = yield third_lot | timeout
+            if third_lot in result:
+                batch.append(result[third_lot])
+            else:
+                third_lot.cancel()
+                break
+        return batch
 
     def _lot_flow(self, lot: Lot) -> Iterator[simpy.Event]:
         for operation in sorted(self.config.operations, key=lambda item: item.ops_id):
             mappings = self.mappings_by_operation.get(operation.ops_id, [])
             if not mappings:
-                raise ValueError(f"No tools are configured for operation {operation.ops_id}")
+                raise ValueError(
+                    f"No tools are configured for operation {operation.ops_id}"
+                )
 
             if self._is_batch_operation(mappings):
                 if operation.ops_id not in lot.operation_entry_times:
@@ -298,14 +362,13 @@ class FabSimulation:
 
     def _batch_dispatcher(self) -> Iterator[simpy.Event]:
         operation = self.operation_by_id[908]
-        pending: list[Lot] = []
         while True:
-            while len(pending) < self.max_batch_lots:
-                pending.append((yield self.waiting_lots.get()))
-
-            batch = pending[: self.max_batch_lots]
-            del pending[:len(batch)]
-            tool = yield self.planned_tools.get()
+            plan: PlannedBatch = yield self.planned_batches.get()
+            batch = []
+            for _ in range(plan.lot_count):
+                batch.append((yield self.waiting_lots.get()))
+            tool = plan.tool
+            tool.wip_batches += 1
             self.events.record(
                 self.env.now,
                 "tool",
@@ -317,64 +380,7 @@ class FabSimulation:
                 details=f"{len(batch)} lots",
             )
             yield tool.batch_queue.put((batch, operation))
-
-    def _reserve_tool_for_batch(
-        self, mappings: list[ToolOperationConfig]
-    ) -> Tool | None:
-        operation = self.operation_by_id[908]
-        stage_mapping = self.mappings_by_operation[907][0]
-        operation_entry_time = (
-            self.env.now + stage_mapping.proc_time_per_load_mins
-        )
-        eligible_tools = [
-            self.tool_by_id[mapping.tool_id]
-            for mapping in mappings
-            if self._can_accept_batch(
-                self.tool_by_id[mapping.tool_id],
-                operation,
-                operation_entry_time,
-            )
-        ]
-        if not eligible_tools:
-            return None
-        tool = min(
-            eligible_tools,
-            key=lambda item: (item.estimated_available_at, item.config.tool_id),
-        )
-        mapping = tool.operation_config
-        tool.estimated_available_at = max(
-            operation_entry_time, tool.estimated_available_at
-        ) + mapping.proc_time_per_load_mins
-        tool.outstanding_batches += 1
-        return tool
-
-    def _can_accept_batch(
-        self,
-        tool: Tool,
-        operation: OperationConfig,
-        operation_entry_time: float,
-    ) -> bool:
-        if (
-            tool.pm_pending
-            or tool.outstanding_batches >= self.parameters.op_907_release
-        ):
-            return False
-        if (
-            tool.outstanding_batches
-            and tool.config.run_count_flag
-            and tool.run_count_since_pm + tool.outstanding_batches
-            >= tool.config.pm_run_count
-        ):
-            return False
-
-        estimated_start = max(operation_entry_time, tool.estimated_available_at)
-        if tool.config.time_count_flag:
-            next_pm_at = tool.last_pm_completion + tool.config.pm_mins_count
-            if next_pm_at <= estimated_start:
-                return False
-
-        elapsed = estimated_start - operation_entry_time
-        return elapsed <= operation.max_q_time_mins
+            plan.entered_908.succeed()
 
     def _notify_batch_slot_available(self) -> None:
         if not self.batch_slot_available.triggered:
@@ -394,8 +400,12 @@ class FabSimulation:
                         tool=tool,
                         lot_ids=lot_ids,
                     )
+                tool.current_batch_end_time = (
+                    self.env.now + tool.operation_config.proc_time_per_load_mins
+                )
                 self._record_tool(tool, "in process", lot_ids, operation.ops_id)
                 yield self.env.timeout(tool.operation_config.proc_time_per_load_mins)
+                tool.current_batch_end_time = None
                 for lot in batch:
                     self._record_lot(
                         lot,
@@ -413,7 +423,7 @@ class FabSimulation:
                 )
                 if run_count_pm_due:
                     tool.pm_pending = True
-                tool.outstanding_batches -= 1
+                tool.wip_batches -= 1
                 self._notify_batch_slot_available()
                 if run_count_pm_due:
                     yield self.env.process(self._perform_pm(tool, "run count"))
@@ -439,11 +449,15 @@ class FabSimulation:
 
     def _perform_pm(self, tool: Tool, trigger: str) -> Iterator[simpy.Event]:
         tool.pm_pending = True
+        tool.pm_active = True
+        tool.pm_completion_at = self.env.now + tool.config.pm_duration_mins
         self._record_tool(tool, "PM started", (), details=f"trigger: {trigger}")
         yield self.env.timeout(tool.config.pm_duration_mins)
         tool.run_count_since_pm = 0
         tool.last_pm_completion = self.env.now
         tool.pm_pending = False
+        tool.pm_active = False
+        tool.pm_completion_at = None
         self._record_tool(tool, "PM completed", (), details=f"trigger: {trigger}")
         self._notify_batch_slot_available()
 

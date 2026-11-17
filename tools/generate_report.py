@@ -75,6 +75,7 @@ HTML_TEMPLATE = """<!doctype html>
   </section>
   <section class="panel">
     <h2>Operation status</h2>
+    <div class="muted">907 WIP and Q907 start when a lot arrives at the 907 entrance; Q907 ends when processing starts.</div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>ops_id</th><th>Description</th><th>WIP (wafer)</th><th>In process (wafer)</th><th>Hold (wafer)</th><th>Tool status</th><th>Current shift outs (wafer)</th><th>Last shift outs (wafer)</th><th>Last 7 days outs (wafer)</th></tr></thead>
@@ -419,7 +420,13 @@ def build_report_data(
                 lot_id, {"ops_id": None, "status": "active", "in_process": False}
             )
             event_name = event["event"]
-            if event_name == "moved into operation":
+            if event_name == "arrived at 907 entrance":
+                state.update(
+                    ops_id=int(event["operation_id"]),
+                    status=event["status"] or "active",
+                    in_process=False,
+                )
+            elif event_name == "moved into operation":
                 state.update(
                     ops_id=int(event["operation_id"]),
                     status=event["status"] or "active",

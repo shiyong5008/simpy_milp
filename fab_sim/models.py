@@ -22,8 +22,10 @@ class Tool:
     operation_config: ToolOperationConfig
     resource: simpy.PriorityResource
     batch_queue: simpy.Store
-    outstanding_batches: int = 0
+    wip_batches: int = 0
     pm_pending: bool = False
+    pm_active: bool = False
     run_count_since_pm: int = 0
     last_pm_completion: float = 0.0
-    estimated_available_at: float = 0.0
+    pm_completion_at: float | None = None
+    current_batch_end_time: float | None = None
