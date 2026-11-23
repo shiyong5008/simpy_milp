@@ -22,10 +22,10 @@ Edit `data/simulation_parameters.csv` to set the run inputs:
 | `op_907_release` | Maximum number of operation 908 batches in each tool's 908 WIP, including batches waiting to process and currently processing. The parameter name is retained for compatibility. |
 | `random_seed` | Seed for reproducible random lot-arrival times. |
 
-The checked-in parameter file currently specifies an average of 20 lots per
+The checked-in parameter file currently specifies an average of 11 lots per
 shift, 672 simulation hours, 25 wafers per lot, two batches per operation 908
-tool, and seed 1. This arrival rate exceeds the combined VFP capacity to
-exercise the 907 WIP queue; arrivals remain stochastic, so 20 is not a hard
+tool, and seed 1. This arrival rate meets the combined VFP capacity to
+exercise the 907 WIP queue; arrivals remain stochastic, so 11 is not a hard
 per-shift maximum.
 
 ## Current simulation behavior
@@ -60,7 +60,7 @@ for an active load to finish, and no new batch starts until the PM completes.
 
 VFP701 and VFP702 are parallel tools for operation 908. Each load counts as one
 run for PM, whether it contains two or three lots. Unexpected queue-time
-breaches are still recorded as `hold`. Under the checked-in 20-lots/shift
+breaches are still recorded as `hold`. Under the 20-lots/shift
 overload, Q907 may breach while lots wait at 907; the MILP screens projected
 908 Q-time breaches when scheduling a batch.
 
